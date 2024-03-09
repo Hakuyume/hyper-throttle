@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 resolver = "2"
 
+description = "bandwidth throttle for hyper"
+license = "MIT"
+repository = "https://github.com/Hakuyume/hyper-throttle"
+
 [package.metadata.docs.rs]
 all-features = true
 
