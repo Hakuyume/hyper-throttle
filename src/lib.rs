@@ -1,3 +1,25 @@
+//! ```rust
+//! use bytes::Bytes;
+//! use http_body_util::{BodyExt, Empty};
+//! use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+//! use hyper_util::client::legacy::connect::HttpConnector;
+//! use hyper_util::client::legacy::Client;
+//! use hyper_util::rt::{TokioExecutor, TokioTimer};
+//!
+//! let mut connector = HttpConnector::new();
+//! connector.enforce_http(false);
+//! let connector = hyper_throttle::Connector::builder(TokioTimer::new())
+//!     .read_rate(65536) // 64 KiB/s
+//!     .build(connector);
+//! let connector = HttpsConnectorBuilder::new()
+//!     .with_native_roots()?
+//!     .https_or_http()
+//!     .enable_all_versions()
+//!     .wrap_connector(connector);
+//! let client = Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(connector);
+//! # std::io::Result::Ok(())
+//! ```
+
 use http::Uri;
 use hyper::rt::{Read, ReadBuf, ReadBufCursor, Sleep, Timer, Write};
 use std::future;
