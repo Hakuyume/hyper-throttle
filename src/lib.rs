@@ -1,6 +1,5 @@
 use http::Uri;
 use hyper::rt::{Read, ReadBuf, ReadBufCursor, Write};
-use hyper_util::client::legacy::connect::{Connected, Connection};
 use std::future::{self, Future as _};
 use std::io;
 use std::pin::Pin;
@@ -29,7 +28,6 @@ impl<T> Connector<T> {
 impl<T> Service<Uri> for Connector<T>
 where
     T: Service<Uri>,
-    T::Response: Connection + Read + Write,
 {
     type Response = Stream<T::Response>;
     type Error = T::Error;
@@ -54,15 +52,6 @@ pub struct Stream<T> {
     write_rate: Option<u64>,
     read_sleep: Option<(usize, Pin<Box<Sleep>>)>,
     write_sleep: Option<(usize, Pin<Box<Sleep>>)>,
-}
-
-impl<T> Connection for Stream<T>
-where
-    T: Connection,
-{
-    fn connected(&self) -> Connected {
-        self.inner.connected()
-    }
 }
 
 fn call<F>(
@@ -143,6 +132,16 @@ where
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "hyper-util")]
+impl<T> hyper_util::client::legacy::connect::Connection for Stream<T>
+where
+    T: hyper_util::client::legacy::connect::Connection,
+{
+    fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
+        self.inner.connected()
     }
 }
 

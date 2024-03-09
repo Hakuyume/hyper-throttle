@@ -2,13 +2,14 @@
 name = "hyper-throttle"
 version = "0.1.0"
 edition = "2021"
+resolver = "2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 http = "1"
 hyper = "1"
-hyper-util = { version = "0.1", features = ["client-legacy"] }
+hyper-util = { version = "0.1", features = ["client-legacy"], optional = true }
 pin-project = "1"
 tokio = { version = "1", features = ["time"] }
 tower-service = "0.3"
@@ -17,5 +18,7 @@ tower-service = "0.3"
 bytes = "1"
 http-body-util = "0.1"
 hyper-rustls = { version = "0.26", features = ["http1", "http2"] }
+# https://github.com/rust-lang/cargo/issues/2911#issuecomment-749580481
+hyper-throttle = { path = ".", features = ["hyper-util"] }
 hyper-util = { version = "0.1", features = ["http1", "http2", "tokio"] }
 tokio = { version = "1", features = ["macros"] }
