@@ -1,37 +1,68 @@
 use http::Uri;
-use hyper::rt::{Read, ReadBuf, ReadBufCursor, Write};
-use std::future::{self, Future as _};
+use hyper::rt::{Read, ReadBuf, ReadBufCursor, Sleep, Timer, Write};
+use std::future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
-use tokio::time::{self, Sleep};
 use tower_service::Service;
 
-#[derive(Clone, Copy, Debug)]
-pub struct Connector<T> {
-    inner: T,
+pub struct ConnectorBuilder {
+    timer: Arc<dyn Timer + Send + Sync>,
     read_rate: Option<u64>,
     write_rate: Option<u64>,
 }
 
-impl<T> Connector<T> {
-    pub fn new(inner: T, read_rate: Option<u64>, write_rate: Option<u64>) -> Self {
-        Self {
+impl ConnectorBuilder {
+    pub fn build<C>(self, inner: C) -> Connector<C> {
+        Connector {
             inner,
-            read_rate,
-            write_rate,
+            timer: self.timer,
+            read_rate: self.read_rate,
+            write_rate: self.write_rate,
+        }
+    }
+
+    pub fn read_rate(mut self, rate: u64) -> Self {
+        self.read_rate = Some(rate);
+        self
+    }
+
+    pub fn write_rate(mut self, rate: u64) -> Self {
+        self.write_rate = Some(rate);
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct Connector<C> {
+    inner: C,
+    timer: Arc<dyn Timer + Send + Sync>,
+    read_rate: Option<u64>,
+    write_rate: Option<u64>,
+}
+
+impl Connector<()> {
+    pub fn builder<T>(timer: T) -> ConnectorBuilder
+    where
+        T: Timer + Send + Sync + 'static,
+    {
+        ConnectorBuilder {
+            timer: Arc::new(timer),
+            read_rate: None,
+            write_rate: None,
         }
     }
 }
 
-impl<T> Service<Uri> for Connector<T>
+impl<C> Service<Uri> for Connector<C>
 where
-    T: Service<Uri>,
+    C: Service<Uri>,
 {
-    type Response = Stream<T::Response>;
-    type Error = T::Error;
-    type Future = Future<T::Future>;
+    type Response = Stream<C::Response>;
+    type Error = C::Error;
+    type Future = Future<C::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -40,24 +71,27 @@ where
     fn call(&mut self, request: Uri) -> Self::Future {
         Future {
             inner: self.inner.call(request),
+            timer: self.timer.clone(),
             read_rate: self.read_rate,
             write_rate: self.write_rate,
         }
     }
 }
 
-pub struct Stream<T> {
-    inner: T,
+pub struct Stream<S> {
+    inner: S,
+    timer: Arc<dyn Timer + Send + Sync>,
     read_rate: Option<u64>,
     write_rate: Option<u64>,
-    read_sleep: Option<(usize, Pin<Box<Sleep>>)>,
-    write_sleep: Option<(usize, Pin<Box<Sleep>>)>,
+    read_sleep: Option<(usize, Pin<Box<dyn Sleep>>)>,
+    write_sleep: Option<(usize, Pin<Box<dyn Sleep>>)>,
 }
 
 fn call<F>(
     cx: &mut Context<'_>,
+    timer: &dyn Timer,
     rate: Option<u64>,
-    sleep: &mut Option<(usize, Pin<Box<Sleep>>)>,
+    sleep: &mut Option<(usize, Pin<Box<dyn Sleep>>)>,
     mut f: F,
 ) -> Poll<Result<usize, io::Error>>
 where
@@ -73,9 +107,7 @@ where
             if let Some(rate) = rate {
                 *sleep = Some((
                     len,
-                    Box::pin(time::sleep(Duration::from_nanos(
-                        len as u64 * 1_000_000_000 / rate,
-                    ))),
+                    timer.sleep(Duration::from_nanos(len as u64 * 1_000_000_000 / rate)),
                 ));
             } else {
                 break Poll::Ready(Ok(len));
@@ -84,9 +116,9 @@ where
     }
 }
 
-impl<T> Read for Stream<T>
+impl<S> Read for Stream<S>
 where
-    T: Read + Unpin,
+    S: Read + Unpin,
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -96,6 +128,7 @@ where
         let this = self.get_mut();
         let len = ready!(call(
             cx,
+            &*this.timer,
             this.read_rate,
             &mut this.read_sleep,
             |cx| unsafe {
@@ -109,9 +142,9 @@ where
     }
 }
 
-impl<T> Write for Stream<T>
+impl<S> Write for Stream<S>
 where
-    T: Write + Unpin,
+    S: Write + Unpin,
 {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -119,9 +152,13 @@ where
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         let this = self.get_mut();
-        call(cx, this.write_rate, &mut this.write_sleep, |cx| {
-            Pin::new(&mut this.inner).poll_write(cx, buf)
-        })
+        call(
+            cx,
+            &*this.timer,
+            this.write_rate,
+            &mut this.write_sleep,
+            |cx| Pin::new(&mut this.inner).poll_write(cx, buf),
+        )
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -136,9 +173,9 @@ where
 }
 
 #[cfg(feature = "hyper-util")]
-impl<T> hyper_util::client::legacy::connect::Connection for Stream<T>
+impl<S> hyper_util::client::legacy::connect::Connection for Stream<S>
 where
-    T: hyper_util::client::legacy::connect::Connection,
+    S: hyper_util::client::legacy::connect::Connection,
 {
     fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
         self.inner.connected()
@@ -146,9 +183,10 @@ where
 }
 
 #[pin_project::pin_project]
-pub struct Future<T> {
+pub struct Future<F> {
     #[pin]
-    inner: T,
+    inner: F,
+    timer: Arc<dyn Timer + Send + Sync>,
     read_rate: Option<u64>,
     write_rate: Option<u64>,
 }
@@ -163,6 +201,7 @@ where
         let this = self.project();
         this.inner.poll(cx).map_ok(|inner| Stream {
             inner,
+            timer: this.timer.clone(),
             read_rate: *this.read_rate,
             write_rate: *this.write_rate,
             read_sleep: None,
@@ -178,7 +217,7 @@ mod tests {
     use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
     use hyper_util::client::legacy::connect::HttpConnector;
     use hyper_util::client::legacy::Client;
-    use hyper_util::rt::TokioExecutor;
+    use hyper_util::rt::{TokioExecutor, TokioTimer};
     use std::time::{Duration, Instant};
 
     fn client(
@@ -187,7 +226,14 @@ mod tests {
     ) -> Client<HttpsConnector<super::Connector<HttpConnector>>, Empty<Bytes>> {
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
-        let connector = super::Connector::new(connector, read_rate, write_rate);
+        let mut builder = super::Connector::builder(TokioTimer::new());
+        if let Some(rate) = read_rate {
+            builder = builder.read_rate(rate);
+        }
+        if let Some(rate) = write_rate {
+            builder = builder.write_rate(rate);
+        }
+        let connector = builder.build(connector);
         let connector = HttpsConnectorBuilder::new()
             .with_native_roots()
             .unwrap()
