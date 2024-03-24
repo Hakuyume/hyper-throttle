@@ -100,7 +100,9 @@ where
     }
 }
 
+#[pin_project::pin_project]
 pub struct Stream<S> {
+    #[pin]
     inner: S,
     timer: Arc<dyn Timer + Send + Sync>,
     read_rate: Option<u64>,
@@ -109,14 +111,15 @@ pub struct Stream<S> {
     write_sleep: Option<(usize, Pin<Box<dyn Sleep>>)>,
 }
 
-fn call<F>(
+fn call<T, F>(
     cx: &mut Context<'_>,
-    timer: &dyn Timer,
+    timer: &T,
     rate: Option<u64>,
     sleep: &mut Option<(usize, Pin<Box<dyn Sleep>>)>,
     mut f: F,
 ) -> Poll<Result<usize, io::Error>>
 where
+    T: Timer + ?Sized,
     F: FnMut(&mut Context<'_>) -> Poll<Result<usize, io::Error>>,
 {
     loop {
@@ -140,22 +143,22 @@ where
 
 impl<S> Read for Stream<S>
 where
-    S: Read + Unpin,
+    S: Read,
 {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut buf: ReadBufCursor<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        let this = self.get_mut();
+        let mut this = self.project();
         let len = ready!(call(
             cx,
-            &*this.timer,
-            this.read_rate,
-            &mut this.read_sleep,
+            this.timer.as_ref(),
+            *this.read_rate,
+            this.read_sleep,
             |cx| unsafe {
                 let mut buf = ReadBuf::uninit(buf.as_mut());
-                ready!(Pin::new(&mut this.inner).poll_read(cx, buf.unfilled())?);
+                ready!(this.inner.as_mut().poll_read(cx, buf.unfilled())?);
                 Poll::Ready(Ok(buf.filled().len()))
             }
         )?);
@@ -166,31 +169,31 @@ where
 
 impl<S> Write for Stream<S>
 where
-    S: Write + Unpin,
+    S: Write,
 {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        let this = self.get_mut();
+        let mut this = self.project();
         call(
             cx,
-            &*this.timer,
-            this.write_rate,
-            &mut this.write_sleep,
-            |cx| Pin::new(&mut this.inner).poll_write(cx, buf),
+            this.timer.as_ref(),
+            *this.write_rate,
+            this.write_sleep,
+            |cx| this.inner.as_mut().poll_write(cx, buf),
         )
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.inner).poll_flush(cx)
+        let this = self.project();
+        this.inner.poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        let this = self.get_mut();
-        Pin::new(&mut this.inner).poll_shutdown(cx)
+        let this = self.project();
+        this.inner.poll_shutdown(cx)
     }
 }
 
