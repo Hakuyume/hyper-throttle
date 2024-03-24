@@ -107,37 +107,45 @@ pub struct Stream<S> {
     #[pin]
     inner: S,
     timer: Arc<dyn Timer + Send + Sync>,
-    read_rate: Option<u64>,
-    write_rate: Option<u64>,
-    read_sleep: Option<(usize, Pin<Box<dyn Sleep>>)>,
-    write_sleep: Option<(usize, Pin<Box<dyn Sleep>>)>,
+    read: Throttle,
+    write: Throttle,
 }
 
-fn call<T, F>(
-    cx: &mut Context<'_>,
-    timer: &T,
+struct Throttle {
     rate: Option<u64>,
-    sleep: &mut Option<(usize, Pin<Box<dyn Sleep>>)>,
-    mut f: F,
-) -> Poll<Result<usize, io::Error>>
-where
-    T: Timer + ?Sized,
-    F: FnMut(&mut Context<'_>) -> Poll<Result<usize, io::Error>>,
-{
-    loop {
-        if let Some((len, ref mut f)) = *sleep {
-            ready!(f.as_mut().poll(cx));
-            *sleep = None;
-            break Poll::Ready(Ok(len));
-        }
-        let len = ready!(f(cx)?);
-        if let Some(rate) = rate {
-            *sleep = Some((
-                len,
-                timer.sleep(Duration::from_nanos(len as u64 * 1_000_000_000 / rate)),
-            ));
-        } else {
-            break Poll::Ready(Ok(len));
+    sleep: Option<(usize, Pin<Box<dyn Sleep>>)>,
+}
+
+impl Throttle {
+    fn new(rate: Option<u64>) -> Self {
+        Self { rate, sleep: None }
+    }
+
+    fn poll<T, F>(
+        &mut self,
+        cx: &mut Context<'_>,
+        timer: &T,
+        mut f: F,
+    ) -> Poll<Result<usize, io::Error>>
+    where
+        T: Timer + ?Sized,
+        F: FnMut(&mut Context<'_>) -> Poll<Result<usize, io::Error>>,
+    {
+        loop {
+            if let Some((len, ref mut f)) = self.sleep {
+                ready!(f.as_mut().poll(cx));
+                self.sleep = None;
+                break Poll::Ready(Ok(len));
+            }
+            let len = ready!(f(cx)?);
+            if let Some(rate) = self.rate {
+                self.sleep = Some((
+                    len,
+                    timer.sleep(Duration::from_nanos(len as u64 * 1_000_000_000 / rate)),
+                ));
+            } else {
+                break Poll::Ready(Ok(len));
+            }
         }
     }
 }
@@ -152,17 +160,11 @@ where
         mut buf: ReadBufCursor<'_>,
     ) -> Poll<Result<(), io::Error>> {
         let mut this = self.project();
-        let len = ready!(call(
-            cx,
-            this.timer.as_ref(),
-            *this.read_rate,
-            this.read_sleep,
-            |cx| unsafe {
-                let mut buf = ReadBuf::uninit(buf.as_mut());
-                ready!(this.inner.as_mut().poll_read(cx, buf.unfilled())?);
-                Poll::Ready(Ok(buf.filled().len()))
-            }
-        )?);
+        let len = ready!(this.read.poll(cx, this.timer.as_ref(), |cx| unsafe {
+            let mut buf = ReadBuf::uninit(buf.as_mut());
+            ready!(this.inner.as_mut().poll_read(cx, buf.unfilled())?);
+            Poll::Ready(Ok(buf.filled().len()))
+        })?);
         unsafe { buf.advance(len) };
         Poll::Ready(Ok(()))
     }
@@ -178,13 +180,9 @@ where
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         let mut this = self.project();
-        call(
-            cx,
-            this.timer.as_ref(),
-            *this.write_rate,
-            this.write_sleep,
-            |cx| this.inner.as_mut().poll_write(cx, buf),
-        )
+        this.write.poll(cx, this.timer.as_ref(), |cx| {
+            this.inner.as_mut().poll_write(cx, buf)
+        })
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -207,13 +205,9 @@ where
         bufs: &[IoSlice<'_>],
     ) -> Poll<Result<usize, io::Error>> {
         let mut this = self.project();
-        call(
-            cx,
-            this.timer.as_ref(),
-            *this.write_rate,
-            this.write_sleep,
-            |cx| this.inner.as_mut().poll_write_vectored(cx, bufs),
-        )
+        this.write.poll(cx, this.timer.as_ref(), |cx| {
+            this.inner.as_mut().poll_write_vectored(cx, bufs)
+        })
     }
 }
 
@@ -247,10 +241,8 @@ where
         this.inner.poll(cx).map_ok(|inner| Stream {
             inner,
             timer: this.timer.clone(),
-            read_rate: *this.read_rate,
-            write_rate: *this.write_rate,
-            read_sleep: None,
-            write_sleep: None,
+            read: Throttle::new(*this.read_rate),
+            write: Throttle::new(*this.write_rate),
         })
     }
 }
