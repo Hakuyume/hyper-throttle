@@ -46,11 +46,13 @@ impl ConnectorBuilder {
         }
     }
 
+    #[must_use]
     pub fn read_rate(mut self, rate: u64) -> Self {
         self.read_rate = Some(rate);
         self
     }
 
+    #[must_use]
     pub fn write_rate(mut self, rate: u64) -> Self {
         self.write_rate = Some(rate);
         self
@@ -127,16 +129,15 @@ where
             ready!(f.as_mut().poll(cx));
             *sleep = None;
             break Poll::Ready(Ok(len));
+        }
+        let len = ready!(f(cx)?);
+        if let Some(rate) = rate {
+            *sleep = Some((
+                len,
+                timer.sleep(Duration::from_nanos(len as u64 * 1_000_000_000 / rate)),
+            ));
         } else {
-            let len = ready!(f(cx)?);
-            if let Some(rate) = rate {
-                *sleep = Some((
-                    len,
-                    timer.sleep(Duration::from_nanos(len as u64 * 1_000_000_000 / rate)),
-                ));
-            } else {
-                break Poll::Ready(Ok(len));
-            }
+            break Poll::Ready(Ok(len));
         }
     }
 }
