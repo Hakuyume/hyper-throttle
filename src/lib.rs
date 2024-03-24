@@ -23,7 +23,7 @@
 use http::Uri;
 use hyper::rt::{Read, ReadBuf, ReadBufCursor, Sleep, Timer, Write};
 use std::future;
-use std::io;
+use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
@@ -195,6 +195,25 @@ where
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         let this = self.project();
         this.inner.poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        let mut this = self.project();
+        call(
+            cx,
+            this.timer.as_ref(),
+            *this.write_rate,
+            this.write_sleep,
+            |cx| this.inner.as_mut().poll_write_vectored(cx, bufs),
+        )
     }
 }
 
