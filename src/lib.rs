@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_thorottle() {
+    async fn test_throttle() {
         let client = client(Some(4096), Some(4096));
         let now = Instant::now();
         let response = client
