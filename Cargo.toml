@@ -20,6 +20,7 @@ tower-service = "0.3"
 
 [dev-dependencies]
 bytes = "1"
+futures = "0.3"
 http-body-util = "0.1"
 hyper-rustls = { version = "0.26", features = ["http1", "http2"] }
 # https://github.com/rust-lang/cargo/issues/2911#issuecomment-749580481

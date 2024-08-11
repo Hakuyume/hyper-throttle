@@ -41,8 +41,11 @@ async fn get(client: &Client, uri: &str) {
 async fn test_throttle() {
     let client = client(Some(4096.), Some(4096.));
     let now = Instant::now();
-    get(&client, "https://www.rust-lang.org").await;
-    get(&client, "https://www.rust-lang.org").await;
+    futures::future::join(
+        get(&client, "https://www.rust-lang.org"),
+        get(&client, "https://www.rust-lang.org"),
+    )
+    .await;
     assert!(now.elapsed() > Duration::from_secs(4));
 }
 
@@ -50,7 +53,10 @@ async fn test_throttle() {
 async fn test_passthrough() {
     let client = client(None, None);
     let now = Instant::now();
-    get(&client, "https://www.rust-lang.org").await;
-    get(&client, "https://www.rust-lang.org").await;
+    futures::future::join(
+        get(&client, "https://www.rust-lang.org"),
+        get(&client, "https://www.rust-lang.org"),
+    )
+    .await;
     assert!(now.elapsed() < Duration::from_secs(2));
 }
