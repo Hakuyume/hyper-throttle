@@ -9,7 +9,7 @@
 //! let mut connector = HttpConnector::new();
 //! connector.enforce_http(false);
 //! let connector = hyper_throttle::Connector::builder(TokioTimer::new())
-//!     .read_rate(65536) // 64 KiB/s
+//!     .read_rate(65536.) // 64 KiB/s
 //!     .build(connector);
 //! let connector = HttpsConnectorBuilder::new()
 //!     .with_native_roots()?
@@ -20,40 +20,41 @@
 //! # std::io::Result::Ok(())
 //! ```
 
+mod throttle;
+
 use http::Uri;
-use hyper::rt::{Read, ReadBuf, ReadBufCursor, Sleep, Timer, Write};
+use hyper::rt::{Read, ReadBuf, ReadBufCursor, Timer, Write};
 use std::future;
 use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
-use std::time::Duration;
+use throttle::Throttle;
 use tower_service::Service;
 
 pub struct ConnectorBuilder {
     timer: Arc<dyn Timer + Send + Sync>,
-    read_rate: Option<u64>,
-    write_rate: Option<u64>,
+    read_rate: Option<f64>,
+    write_rate: Option<f64>,
 }
 
 impl ConnectorBuilder {
     pub fn build<C>(self, inner: C) -> Connector<C> {
         Connector {
             inner,
-            timer: self.timer,
-            read_rate: self.read_rate,
-            write_rate: self.write_rate,
+            read: Throttle::new(self.timer.clone(), self.read_rate),
+            write: Throttle::new(self.timer.clone(), self.write_rate),
         }
     }
 
     #[must_use]
-    pub fn read_rate(mut self, rate: u64) -> Self {
+    pub fn read_rate(mut self, rate: f64) -> Self {
         self.read_rate = Some(rate);
         self
     }
 
     #[must_use]
-    pub fn write_rate(mut self, rate: u64) -> Self {
+    pub fn write_rate(mut self, rate: f64) -> Self {
         self.write_rate = Some(rate);
         self
     }
@@ -62,9 +63,8 @@ impl ConnectorBuilder {
 #[derive(Clone)]
 pub struct Connector<C> {
     inner: C,
-    timer: Arc<dyn Timer + Send + Sync>,
-    read_rate: Option<u64>,
-    write_rate: Option<u64>,
+    read: Throttle,
+    write: Throttle,
 }
 
 impl Connector<()> {
@@ -95,10 +95,33 @@ where
     fn call(&mut self, request: Uri) -> Self::Future {
         Future {
             inner: self.inner.call(request),
-            timer: self.timer.clone(),
-            read_rate: self.read_rate,
-            write_rate: self.write_rate,
+            read: Some(self.read.clone()),
+            write: Some(self.write.clone()),
         }
+    }
+}
+
+#[pin_project::pin_project]
+pub struct Future<F> {
+    #[pin]
+    inner: F,
+    read: Option<Throttle>,
+    write: Option<Throttle>,
+}
+
+impl<F, T, E> future::Future for Future<F>
+where
+    F: future::Future<Output = Result<T, E>>,
+{
+    type Output = Result<Stream<T>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        this.inner.poll(cx).map_ok(|inner| Stream {
+            inner,
+            read: this.read.take().unwrap(),
+            write: this.write.take().unwrap(),
+        })
     }
 }
 
@@ -106,48 +129,8 @@ where
 pub struct Stream<S> {
     #[pin]
     inner: S,
-    timer: Arc<dyn Timer + Send + Sync>,
     read: Throttle,
     write: Throttle,
-}
-
-struct Throttle {
-    rate: Option<u64>,
-    sleep: Option<(usize, Pin<Box<dyn Sleep>>)>,
-}
-
-impl Throttle {
-    fn new(rate: Option<u64>) -> Self {
-        Self { rate, sleep: None }
-    }
-
-    fn poll<T, F>(
-        &mut self,
-        cx: &mut Context<'_>,
-        timer: &T,
-        mut f: F,
-    ) -> Poll<Result<usize, io::Error>>
-    where
-        T: Timer + ?Sized,
-        F: FnMut(&mut Context<'_>) -> Poll<Result<usize, io::Error>>,
-    {
-        loop {
-            if let Some((len, ref mut f)) = self.sleep {
-                ready!(f.as_mut().poll(cx));
-                self.sleep = None;
-                break Poll::Ready(Ok(len));
-            }
-            let len = ready!(f(cx)?);
-            if let Some(rate) = self.rate {
-                self.sleep = Some((
-                    len,
-                    timer.sleep(Duration::from_nanos(len as u64 * 1_000_000_000 / rate)),
-                ));
-            } else {
-                break Poll::Ready(Ok(len));
-            }
-        }
-    }
 }
 
 impl<S> Read for Stream<S>
@@ -160,7 +143,7 @@ where
         mut buf: ReadBufCursor<'_>,
     ) -> Poll<Result<(), io::Error>> {
         let mut this = self.project();
-        let len = ready!(this.read.poll(cx, this.timer.as_ref(), |cx| unsafe {
+        let len = ready!(this.read.poll(cx, |cx| unsafe {
             let mut buf = ReadBuf::uninit(buf.as_mut());
             ready!(this.inner.as_mut().poll_read(cx, buf.unfilled())?);
             Poll::Ready(Ok(buf.filled().len()))
@@ -180,9 +163,8 @@ where
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         let mut this = self.project();
-        this.write.poll(cx, this.timer.as_ref(), |cx| {
-            this.inner.as_mut().poll_write(cx, buf)
-        })
+        this.write
+            .poll(cx, |cx| this.inner.as_mut().poll_write(cx, buf))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -205,9 +187,8 @@ where
         bufs: &[IoSlice<'_>],
     ) -> Poll<Result<usize, io::Error>> {
         let mut this = self.project();
-        this.write.poll(cx, this.timer.as_ref(), |cx| {
-            this.inner.as_mut().poll_write_vectored(cx, bufs)
-        })
+        this.write
+            .poll(cx, |cx| this.inner.as_mut().poll_write_vectored(cx, bufs))
     }
 }
 
@@ -221,89 +202,5 @@ where
     }
 }
 
-#[pin_project::pin_project]
-pub struct Future<F> {
-    #[pin]
-    inner: F,
-    timer: Arc<dyn Timer + Send + Sync>,
-    read_rate: Option<u64>,
-    write_rate: Option<u64>,
-}
-
-impl<F, T, E> future::Future for Future<F>
-where
-    F: future::Future<Output = Result<T, E>>,
-{
-    type Output = Result<Stream<T>, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        this.inner.poll(cx).map_ok(|inner| Stream {
-            inner,
-            timer: this.timer.clone(),
-            read: Throttle::new(*this.read_rate),
-            write: Throttle::new(*this.write_rate),
-        })
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use bytes::Bytes;
-    use http_body_util::{BodyExt, Empty};
-    use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-    use hyper_util::client::legacy::connect::HttpConnector;
-    use hyper_util::client::legacy::Client;
-    use hyper_util::rt::{TokioExecutor, TokioTimer};
-    use std::time::{Duration, Instant};
-
-    fn client(
-        read_rate: Option<u64>,
-        write_rate: Option<u64>,
-    ) -> Client<HttpsConnector<super::Connector<HttpConnector>>, Empty<Bytes>> {
-        let mut connector = HttpConnector::new();
-        connector.enforce_http(false);
-        let mut builder = super::Connector::builder(TokioTimer::new());
-        if let Some(rate) = read_rate {
-            builder = builder.read_rate(rate);
-        }
-        if let Some(rate) = write_rate {
-            builder = builder.write_rate(rate);
-        }
-        let connector = builder.build(connector);
-        let connector = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .unwrap()
-            .https_only()
-            .enable_http1()
-            .enable_http2()
-            .wrap_connector(connector);
-        Client::builder(TokioExecutor::new()).build(connector)
-    }
-
-    #[tokio::test]
-    async fn test_throttle() {
-        let client = client(Some(4096), Some(4096));
-        let now = Instant::now();
-        let response = client
-            .get("https://www.rust-lang.org".parse().unwrap())
-            .await
-            .unwrap();
-        assert!(response.status().is_success());
-        response.into_body().collect().await.unwrap();
-        assert!(now.elapsed() > Duration::from_secs(4));
-    }
-
-    #[tokio::test]
-    async fn test_passthrough() {
-        let client = client(None, None);
-        let now = Instant::now();
-        let response = client
-            .get("https://www.rust-lang.org".parse().unwrap())
-            .await
-            .unwrap();
-        assert!(response.status().is_success());
-        response.into_body().collect().await.unwrap();
-        assert!(now.elapsed() < Duration::from_secs(2));
-    }
-}
+mod tests;
